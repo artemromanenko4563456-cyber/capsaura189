@@ -1,34 +1,38 @@
 package com.example.capsaura;
 
-import com.mojang.blaze3d.platform.InputConstants;
-import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
-import net.fabricmc.loader.api.FabricLoader;
-import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.player.LocalPlayer;
-import net.minecraft.network.chat.Component;
-import net.minecraft.resources.Identifier;
-import net.minecraft.world.InteractionHand;
-import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.LivingEntity;
-import net.minecraft.world.entity.decoration.ArmorStand;
-import net.minecraft.world.entity.monster.Enemy;
-import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.phys.Vec3;
-import org.lwjgl.glfw.GLFW;
+import net.minecraft.client.entity.EntityPlayerSP;
+import net.minecraft.client.settings.KeyBinding;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.item.EntityArmorStand;
+import net.minecraft.entity.monster.IMob;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.util.ChatComponentText;
+import net.minecraft.util.Vec3;
+import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.fml.client.registry.ClientRegistry;
+import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.common.event.FMLInitializationEvent;
+import net.minecraftforge.fml.common.event.FMLPreInitializationEvent;
+import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
+import net.minecraftforge.fml.common.gameevent.TickEvent;
+import org.lwjgl.input.Keyboard;
 
+import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
-public class CapsAuraClient implements ClientModInitializer {
+@Mod(modid = "capsaura", name = "CapsAura", version = "1.0.0",
+		clientSideOnly = true, acceptedMinecraftVersions = "[1.8.9]")
+public class CapsAura {
 
 	// ======== НАСТРОЙКИ ========
-	private static final int TOGGLE_KEY = GLFW.GLFW_KEY_B; // клавиша включения
+	private static final int TOGGLE_KEY = Keyboard.KEY_B;  // клавиша включения
 	private static final double RANGE = 4.0;               // радиус в блоках
 	private static final int ATTACKS_PER_SECOND = 7;       // ударов в секунду (от 1 до 20)
 	private static final boolean ATTACK_PLAYERS = true;    // бить игроков
@@ -37,35 +41,44 @@ public class CapsAuraClient implements ClientModInitializer {
 	private static final boolean AIM = true;               // наводить камеру
 	// ===========================
 
-	private static KeyMapping toggleKey;
+	private static KeyBinding toggleKey;
 	private static boolean enabled = false;
 	private static int attackCharge = 0;
-	private static final Set<String> friends = new HashSet<>();
+	private static File friendsFile;
+	private static final Set<String> friends = new HashSet<String>();
 
-	@Override
-	public void onInitializeClient() {
-		KeyMapping.Category category = KeyMapping.Category.register(
-				Identifier.fromNamespaceAndPath("capsaura", "main"));
-
-		toggleKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
-				"key.capsaura.toggle", InputConstants.Type.KEYSYM, TOGGLE_KEY, category));
-
-		ClientTickEvents.END_CLIENT_TICK.register(CapsAuraClient::onTick);
+	@Mod.EventHandler
+	public void preInit(FMLPreInitializationEvent event) {
+		friendsFile = new File(event.getModConfigurationDirectory(), "capsaura-friends.txt");
 	}
 
-	private static void onTick(Minecraft mc) {
+	@Mod.EventHandler
+	public void init(FMLInitializationEvent event) {
+		toggleKey = new KeyBinding("Toggle Kill Aura", TOGGLE_KEY, "CapsAura");
+		ClientRegistry.registerKeyBinding(toggleKey);
+		MinecraftForge.EVENT_BUS.register(this);
+	}
+
+	@SubscribeEvent
+	public void onTick(TickEvent.ClientTickEvent event) {
+		if (event.phase != TickEvent.Phase.END) {
+			return;
+		}
+		Minecraft mc = Minecraft.getMinecraft();
+
 		handleToggle(mc);
 
-		if (!enabled || mc.player == null || mc.level == null || mc.gameMode == null) {
+		if (!enabled || mc.thePlayer == null || mc.theWorld == null
+				|| mc.playerController == null || mc.currentScreen != null) {
 			return;
 		}
 
-		LocalPlayer player = mc.player;
-		if (!player.isAlive()) {
+		EntityPlayerSP player = mc.thePlayer;
+		if (player.isDead || player.getHealth() <= 0) {
 			return;
 		}
 
-		LivingEntity target = findTarget(mc, player);
+		EntityLivingBase target = findTarget(mc, player);
 		if (target == null) {
 			return;
 		}
@@ -78,35 +91,39 @@ public class CapsAuraClient implements ClientModInitializer {
 		attackCharge += Math.min(ATTACKS_PER_SECOND, 20);
 		if (attackCharge >= 20) {
 			attackCharge -= 20;
-			mc.gameMode.attack(player, target);
-			player.swing(InteractionHand.MAIN_HAND);
+			player.swingItem();
+			mc.playerController.attackEntity(player, target);
 		}
 	}
 
 	private static void handleToggle(Minecraft mc) {
-		while (toggleKey.consumeClick()) {
+		while (toggleKey.isPressed()) {
 			enabled = !enabled;
 			attackCharge = 0;
 			if (enabled) {
 				loadFriends();
 			}
-			if (mc.player != null) {
-				mc.player.sendSystemMessage(Component.literal(
+			if (mc.thePlayer != null) {
+				mc.thePlayer.addChatMessage(new ChatComponentText(
 						"Kill Aura: " + (enabled ? "ON (friends: " + friends.size() + ")" : "OFF")));
 			}
 		}
 	}
 
 	/** Ближайшая подходящая цель в радиусе или null. */
-	private static LivingEntity findTarget(Minecraft mc, LocalPlayer player) {
-		LivingEntity best = null;
-		double bestDist = RANGE * RANGE;
+	private static EntityLivingBase findTarget(Minecraft mc, EntityPlayerSP player) {
+		EntityLivingBase best = null;
+		double bestDist = RANGE;
 
-		for (Entity e : mc.level.entitiesForRendering()) {
-			if (!(e instanceof LivingEntity living) || !isValidTarget(player, living)) {
+		for (Entity e : mc.theWorld.loadedEntityList) {
+			if (!(e instanceof EntityLivingBase)) {
 				continue;
 			}
-			double dist = player.distanceToSqr(living);
+			EntityLivingBase living = (EntityLivingBase) e;
+			if (!isValidTarget(player, living)) {
+				continue;
+			}
+			double dist = player.getDistanceToEntity(living);
 			if (dist < bestDist) {
 				bestDist = dist;
 				best = living;
@@ -115,44 +132,43 @@ public class CapsAuraClient implements ClientModInitializer {
 		return best;
 	}
 
-	private static boolean isValidTarget(LocalPlayer self, LivingEntity e) {
-		if (e == self || !e.isAlive() || e instanceof ArmorStand) {
+	private static boolean isValidTarget(EntityPlayerSP self, EntityLivingBase e) {
+		if (e == self || e.isDead || e.getHealth() <= 0 || e instanceof EntityArmorStand) {
 			return false;
 		}
-		if (e instanceof Player) {
+		if (e instanceof EntityPlayer) {
 			if (!ATTACK_PLAYERS) return false;
-			return !friends.contains(e.getName().getString().toLowerCase(Locale.ROOT));
+			return !friends.contains(e.getName().toLowerCase(Locale.ROOT));
 		}
-		if (e instanceof Enemy) {
+		if (e instanceof IMob) {
 			return ATTACK_HOSTILE;
 		}
 		return ATTACK_PASSIVE;
 	}
 
 	/** Поворачивает камеру на центр цели. */
-	private static void aimAt(LocalPlayer player, LivingEntity target) {
-		Vec3 from = player.getEyePosition();
-		Vec3 to = target.getBoundingBox().getCenter();
-		double dx = to.x - from.x;
-		double dy = to.y - from.y;
-		double dz = to.z - from.z;
+	private static void aimAt(EntityPlayerSP player, EntityLivingBase target) {
+		Vec3 eyes = player.getPositionEyes(1.0f);
+		double dx = target.posX - eyes.xCoord;
+		double dy = (target.posY + target.height / 2.0) - eyes.yCoord;
+		double dz = target.posZ - eyes.zCoord;
 		double flat = Math.sqrt(dx * dx + dz * dz);
 
-		player.setYRot((float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
-		player.setXRot((float) (-Math.toDegrees(Math.atan2(dy, flat))));
+		player.rotationYaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+		player.rotationPitch = (float) (-Math.toDegrees(Math.atan2(dy, flat)));
 	}
 
 	/** Читает config/capsaura-friends.txt (создаёт, если нет). */
 	private static void loadFriends() {
 		friends.clear();
 		try {
-			Path file = FabricLoader.getInstance().getConfigDir().resolve("capsaura-friends.txt");
-			if (!Files.exists(file)) {
-				Files.writeString(file,
-						"# Friends: one nickname per line. The aura will not touch them.\n"
-						+ "# Lines starting with # are ignored. Case does not matter.\n");
+			if (!friendsFile.exists()) {
+				String header = "# Friends: one nickname per line. The aura will not touch them.\n"
+						+ "# Lines starting with # are ignored. Case does not matter.\n";
+				Files.write(friendsFile.toPath(), header.getBytes(StandardCharsets.UTF_8));
 			}
-			for (String line : Files.readAllLines(file)) {
+			List<String> lines = Files.readAllLines(friendsFile.toPath(), StandardCharsets.UTF_8);
+			for (String line : lines) {
 				String name = line.trim();
 				if (!name.isEmpty() && !name.startsWith("#")) {
 					friends.add(name.toLowerCase(Locale.ROOT));
